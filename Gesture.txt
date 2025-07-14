@@ -1,0 +1,1776 @@
+#include <vector>
+#include <Arduino.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <WiFi.h>
+#include <Preferences.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <DNSServer.h>
+#include <RevEng_PAJ7620.h>
+// Define the sensor object
+RevEng_PAJ7620 gestureSensor;
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+
+#include "nvs.h"
+#include "nvs_flash.h"
+unsigned long lastFlashUpdate = 0;
+
+AsyncEventSource events("/events");  // SSE Endpoint
+
+
+#define GES_REACTION_TIME 500
+#define GES_ENTRY_TIME 800
+#define GES_QUIT_TIME 1000
+#define MAX_GESTURES 9  // ✅ Define how many gestures we support
+
+const char *configPageURL = "/config";  // Webpage for configuring gestures
+
+// Initialize U8G2 display
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+Preferences preferences;
+AsyncWebServer server(80);
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+
+// Define physical reset button on GPIO2
+const int resetButtonPin = 2;
+String wifiSSID, wifiPassword;
+bool isAPMode = false;
+String lastGesture = "None";
+
+// Webhook storage for 9 gestures
+
+#define MAX_LOG_ENTRIES 30  // Store the last 30 log messages
+String logBuffer[MAX_LOG_ENTRIES];
+int logIndex = 0;
+
+static String receivedData;
+
+
+
+// Function to store logs in a circular buffer
+String getTimestamp() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "00:00:00";
+  }
+
+  char buffer[20];
+  strftime(buffer, sizeof(buffer), "%H:%M:%S", &timeinfo);  // Format: HH:MM:SS
+  return String(buffer);
+}
+
+void addLog(const String &message) {
+  String timestampedMessage = "[" + getTimestamp() + "] " + message;
+
+  logBuffer[logIndex] = timestampedMessage;     // Overwrite oldest message
+  logIndex = (logIndex + 1) % MAX_LOG_ENTRIES;  // Move to the next index
+
+  Serial.println(timestampedMessage);                              // Print to Serial Monitor
+  events.send(timestampedMessage.c_str(), "logUpdate", millis());  // Send SSE update
+}
+
+
+
+
+// Function to update OLED display
+
+void updateDisplay(const char *status, const char *gesture, const char *action, const char *ipAddress) {
+  static String lastDisplayStatus = "";
+  static String lastDisplayGesture = "";
+  static String lastDisplayAction = "";
+  static String lastDisplayIP = "";
+
+  // ✅ Ensure Default Values
+  if (gesture == nullptr || strlen(gesture) == 0) gesture = "Waiting for Gesture...";
+  if (action == nullptr || strlen(action) == 0) action = "No Action";
+
+  // ✅ Prevent unnecessary redraws
+  if (lastDisplayStatus == status && lastDisplayGesture == gesture && lastDisplayAction == action && lastDisplayIP == ipAddress) {
+    return;
+  }
+
+  lastDisplayStatus = status;
+  lastDisplayGesture = gesture;
+  lastDisplayAction = action;
+  lastDisplayIP = ipAddress;
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+
+  u8g2.drawStr(5, 10, status);
+  u8g2.drawStr(5, 25, gesture);
+  u8g2.drawStr(5, 40, action);
+  u8g2.drawStr(5, 55, ipAddress);
+
+  u8g2.sendBuffer();
+
+  Serial.printf("📟 OLED Updated: [%s | %s | %s | %s]\n", status, gesture, action, ipAddress);
+}
+
+
+
+// Function to send a HTTP Push when a gesture is detected
+
+void executeGestureActions(const String &gesture) {
+  addLog("🚀 Executing actions for: " + gesture);
+
+  preferences.begin("gestures", true);
+  String gestureKey = gesture + "_actions";
+  String actionsJson = preferences.getString(gestureKey.c_str(), "[]");
+  preferences.end();
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, actionsJson);
+  if (error || !doc.is<JsonArray>()) {
+    addLog("❌ Invalid action data for gesture: " + gesture);
+    updateDisplay("Action Error", gesture.c_str(), "Invalid data", WiFi.localIP().toString().c_str());
+    return;
+  }
+
+  JsonArray actions = doc.as<JsonArray>();
+  if (actions.size() == 0) {
+    addLog("⚠️ No actions configured for gesture: " + gesture);
+    updateDisplay("No Actions Configured", gesture.c_str(), "", WiFi.localIP().toString().c_str());
+    return;
+  }
+
+  for (JsonObject action : actions) {
+    String url = action["url"].as<String>();
+    String body = action["body"].as<String>();
+    String actionName = action["actionName"].as<String>();
+    int delayMs = action["delay"].as<int>();  // Declare it only once
+
+    if (WiFi.status() == WL_CONNECTED && !url.isEmpty()) {
+      HTTPClient http;
+      http.begin(url);
+      http.addHeader("Content-Type", "application/json");
+
+      int httpResponseCode = http.POST(body);
+      String logMessage = "✅ [" + gesture + "] 🎬 [" + actionName + "] 🛜 " + body + " ➡️ " + url + " ➡️ Response: " + String(httpResponseCode);
+      addLog(logMessage);
+
+      http.end();
+      updateDisplay("Gesture Executed", gesture.c_str(), actionName.c_str(), WiFi.localIP().toString().c_str());
+    } else {
+      addLog("❌ Wi-Fi not connected or invalid URL for gesture: " + gesture);
+      updateDisplay("Wi-Fi Error", gesture.c_str(), actionName.c_str(), WiFi.localIP().toString().c_str());
+    }
+
+    delay(delayMs);  // Use the existing variable, don't redeclare it
+  }
+
+  events.send(gesture.c_str(), "gestureUpdate", millis());
+}
+
+
+
+
+// 🌐 Start AP Mode & Serve Wi-Fi Setup Page
+void startAPMode() {
+  Serial.println("🚨 startAPMode() No Wi-Fi credentials. Starting AP Mode...");
+  WiFi.disconnect(true, true);
+  delay(100);
+  WiFi.mode(WIFI_AP_STA);
+
+  bool apStarted = WiFi.softAP("JFG_Gesture_Setup");
+  if (!apStarted) {
+    Serial.println("❌ Failed to start AP mode! Restarting...");
+    delay(2000);
+    ESP.restart();
+  }
+
+  isAPMode = true;
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+
+  Serial.printf("📡 startAPMode() AP Mode Active. Connect to: %s\n", WiFi.softAPIP().toString().c_str());
+  updateDisplay("JFG Gesture Control", "Houston we have a problem", "Wi-Fi Setup", WiFi.softAPIP().toString().c_str());
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->redirect("/wifiSetup");
+  });
+
+  server.on("/wifiSetup", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("📡 startAPMode() Scanning Wi-Fi networks...");
+
+    // Set to store unique SSIDs
+    std::vector<String> uniqueSSIDs;
+
+    int n = WiFi.scanNetworks();
+    for (int i = 0; i < n; i++) {
+      String ssid = WiFi.SSID(i);
+      // Only add SSID if it's not already in the list
+      if (std::find(uniqueSSIDs.begin(), uniqueSSIDs.end(), ssid) == uniqueSSIDs.end()) {
+        uniqueSSIDs.push_back(ssid);
+      }
+    }
+
+    // Start generating the HTML page
+    String page = R"rawliteral(
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>JFG Gesture Controller</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <script>
+                    function connectWiFi() {
+                        let ssid = document.getElementById("ssid").value;
+                        let password = document.getElementById("password").value;
+
+                        if (ssid === "") {
+                            alert("⚠️ Please select or enter an SSID!");
+                            return;
+                        }
+
+                        fetch("/saveWiFi", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ "ssid": ssid, "password": password })
+                        }).then(response => response.text())
+                          .then(text => alert(text + "\\nESP32 will restart now."))
+                          .then(() => setTimeout(() => location.reload(), 3000));
+                    }
+                </script>
+                <style>
+                    body { font-family: Arial, sans-serif; text-align: center; background: #f4f4f4; }
+                    .container { max-width: 400px; margin: auto; padding: 20px; background: white; border-radius: 10px; }
+                    select, input, button { width: 100%; padding: 10px; margin: 10px 0; }
+                    button { background: #007bff; color: white; border: none; cursor: pointer; }
+                    button:hover { background: #0056b3; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>JFG ESP32 Wi-Fi Setup</h1>
+                    <label>Select SSID:</label>
+                    <select id="ssid">
+        )rawliteral";
+
+    for (size_t i = 0; i < uniqueSSIDs.size(); i++) {
+      page += "<option value='" + uniqueSSIDs[i] + "'>" + uniqueSSIDs[i] + "</option>";
+    }
+
+
+    // Continue with manual SSID entry
+    page += R"rawliteral(
+                    </select>
+                    <label>Or Enter SSID:</label>
+                    <input type="text" id="manual_ssid" placeholder="Enter SSID (if hidden)">
+                    <script>
+                        document.getElementById("manual_ssid").addEventListener("input", function() {
+                            document.getElementById("ssid").value = this.value;
+                        });
+                    </script>
+                    <label>Password:</label>
+                    <input type="password" id="password" placeholder="Enter Wi-Fi Password">
+                    <button onclick="connectWiFi()">Save & Connect</button>
+                </div>
+            </body>
+            </html>
+        )rawliteral";
+
+    request->send(200, "text/html", page);
+  });
+
+
+  server.on("/wifiStatus", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    doc["ssid"] = WiFi.SSID();
+    doc["ip"] = WiFi.localIP().toString();
+    doc["status"] = WiFi.status();
+
+    String jsonResponse;
+    serializeJson(doc, jsonResponse);
+    request->send(200, "application/json", jsonResponse);
+  });
+
+
+  server.on(
+    "/saveWiFi", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      String receivedData = String((char *)data).substring(0, len);
+      Serial.println("📥 startAPMode() /saveWiFi Received Wi-Fi Config: " + receivedData);
+
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, receivedData);
+
+      if (error) {
+        request->send(400, "text/plain", "❌ Invalid JSON format");
+        return;
+      }
+
+      String newSSID = doc["ssid"].as<String>();
+      String newPassword = doc["password"].as<String>();
+
+      if (newSSID.isEmpty()) {
+        request->send(400, "text/plain", "❌ SSID cannot be empty");
+        return;
+      }
+
+      preferences.begin("wifi", false);
+      preferences.putString("ssid", newSSID);
+      preferences.putString("password", newPassword);
+      preferences.end();
+
+      Serial.println("✅ startAPMode() Wi-Fi credentials saved! Restarting...");
+      request->send(200, "text/plain", "✅ Wi-Fi credentials saved!");
+      delay(1000);
+      ESP.restart();
+    });
+
+  server.begin();
+}
+
+// Function to stop AP mode and switch back to Wi-Fi client mode
+void stopAPMode() {
+  addLog("🛑 Stopping AP Mode...");
+  WiFi.softAPdisconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+  isAPMode = false;
+  delay(500);
+}
+
+
+
+// Function to start the web server and define routes
+void serveWebServer() {
+  Serial.println("Initializing Main Web Server (serveWebServer)...");
+
+  server.on("/logs", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    JsonArray jsonArray = doc.to<JsonArray>();
+
+    for (int i = 0; i < MAX_LOG_ENTRIES; i++) {
+      int index = (logIndex + i) % MAX_LOG_ENTRIES;
+      if (logBuffer[index].length() > 0) {
+        jsonArray.add(logBuffer[index]);
+      }
+    }
+
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  server.on("/wifiStatus", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    doc["ssid"] = WiFi.SSID();
+    doc["ip"] = WiFi.localIP().toString();
+    doc["status"] = WiFi.status();
+
+    String jsonResponse;
+    serializeJson(doc, jsonResponse);
+    request->send(200, "application/json", jsonResponse);
+  });
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", R"rawliteral(
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>ESP32 Gesture Control</title>
+              <meta charset="UTF-8">
+              <style>
+                  body {
+                      font-family: "Arial Unicode MS", "Noto Sans", "Segoe UI Emoji", Arial, sans-serif;
+                      text-align: center;
+                      background-color: #F9F7C9;
+                      margin: 0;
+                      padding: 20px;
+                  }
+
+                  h1 {
+                      color: #001F4D;
+                  }
+
+                  /* ✅ System Logs Container */
+                  :root {
+                      --max-log-entries: 30; /* ✅ Ensures exactly 30 log entries */
+                      --log-line-height: 24px; /* ✅ Approximate height of each log line */
+                  }
+
+                  /* ✅ System Logs Container - Equal Margins, Dynamic Height */
+                  .log-container {
+                      width: calc(100% - 40px); /* ✅ Ensures equal left & right margins */
+                      max-width: 100%;
+                      margin: 20px auto; /* ✅ Adds equal margin (left, right, and bottom) */
+                      background: #001F4D;
+                      padding: 10px;
+                      border-radius: 5px;
+                      overflow-y: auto;
+                      text-align: left;
+                      white-space: nowrap;
+                      font-size: 12px;
+                      font-family: monospace;
+                      color: white;
+
+                      /* ✅ Dynamically adjust height based on window size */
+                      max-height: calc(var(--log-line-height) * var(--max-log-entries));
+
+                      /* ✅ Ensure spacing from footer */
+                      margin-bottom: 50px;
+                  }
+
+                  /* ✅ Ensure logs shrink proportionally when resizing */
+                  @media screen and (max-height: 800px) {
+                      .log-container {
+                          max-height: calc(50vh); /* ✅ Logs take up 50% of the window height */
+                      }
+                  }
+
+                  /* ✅ Scrollbar Styling for Normal Mode */
+                  .log-container::-webkit-scrollbar {
+                      width: 10px;
+                  }
+
+                  .log-container::-webkit-scrollbar-track {
+                      background: #333; /* ✅ Darker track for better contrast */
+                  }
+
+                  .log-container::-webkit-scrollbar-thumb {
+                      background: #555; /* ✅ Darker thumb for better contrast */
+                      border-radius: 5px;
+                  }
+
+                  /* ✅ Dark Mode Scrollbar */
+                  .dark-mode .log-container::-webkit-scrollbar-track {
+                      background: #222; /* ✅ Darker track for dark mode */
+                  }
+
+                  .dark-mode .log-container::-webkit-scrollbar-thumb {
+                      background: #888; /* ✅ Darker thumb for dark mode */
+                  }
+
+                  /* ✅ Alternate Background Colors for Log Entries */
+                  .log-entry:nth-child(odd) {
+                      background: black;
+                      color: white;
+                  }
+                  .log-entry:nth-child(even) {
+                      background: #001F4D;
+                      color: white;
+                  }
+
+                  /* ✅ Remove Border from Log Entries */
+                  .log-entry {
+                      padding: 5px;
+                      border: none;
+                  }
+
+                  /* ✅ Footer & Disclaimer Fix */
+                  footer {
+                      position: relative;
+                      bottom: 0;
+                      width: 100%;
+                      text-align: center;
+                      font-size: 0.9em;
+                      color: gray;
+                      margin-top: 20px; /* ✅ Ensures spacing from logs */
+                  }
+
+
+                  /* ✅ Match Last Action Formatting with Last Gesture */
+                  #gesture, #action {
+                      font-size: 1.7em;
+                      font-weight: bold;
+                      color: #FF3131;
+                  }
+
+
+
+                  /* 🌙 Dark Mode Toggle Button */
+
+                  /* 🔹 Move Dark Mode Toggle to Top Right */
+                  .dark-mode-toggle {
+                      position: absolute;
+                      top: 10px;
+                      right: 15px;
+                      font-size: 0.9em; /* Slightly smaller */
+                  }
+
+                  .switch {
+                      position: relative;
+                      display: inline-block;
+                      width: 34px;
+                      height: 20px;
+                  }
+
+                  .switch input { display: none; }
+
+                  .slider {
+                    position: absolute;
+                    cursor: pointer;
+                    top: 0;
+                    left: 0;
+                    right: 0;
+                    bottom: 0;
+                    background-color: #bbb;
+                    transition: .4s;
+                    border-radius: 10px;
+                  }
+
+                  .slider:before {
+                    position: absolute;
+                    content: "";
+                    height: 14px;
+                    width: 14px;
+                    left: 3px;
+                    bottom: 3px;
+                    background-color: white;
+                    transition: .4s;
+                    border-radius: 50%;
+                    box-shadow: 0px 0px 6px rgba(0, 0, 0, 0.5);
+                  }
+
+                  input:checked + .slider {
+                    background-color: #007bff;
+                    box-shadow: 0px 0px 10px rgba(0, 123, 255, 0.8);
+                  }
+
+                  input:checked + .slider:before {
+                    transform: translateX(18px);
+                    }
+                    h1 {
+                      font-size: 2.2em; /* Larger title */
+                      text-align: center;
+                      color: #001F4D;  /* Deep rich blue */
+                      text-shadow: 0 0 12px #FF4500, 0 0 20px #B22222, 0 0 30px #660000; /* Red neon glow */
+                  }
+
+                  .gesture-text {
+                      font-size: 1.7em; /* Same font size */
+                      font-weight: bold;
+                      color: #FF3131; /* Bright Red */
+                  }
+
+                  /* ✅ Ensure Last Action has the same format as Last Gesture */
+                  #gesture, #action {
+                      font-size: 1.7em;
+                      font-weight: bold;
+                      color: #FF3131; /* Bright Red */
+}
+                  /* ✅ Blinking Effect (Handled via JavaScript) */
+                  #gesture {
+                      font-size: 1.7em;
+                      font-weight: bold;
+                      color: #FF3131; /* Bright Red for emphasis */
+                  }
+                  /* ✅ Smooth Button Hover Effect */
+                  button {
+                      background-color: #007bff;
+                      color: white;
+                      padding: 12px 20px;
+                      border: none;
+                      cursor: pointer;
+                      font-size: 16px;
+                      border-radius: 4px;
+                      transition: background 0.3s;
+                  }
+
+                  button:hover {
+                      background-color: #0056b3; /* Subtle darker blue */
+                  }
+
+                  /* Special Styling for "Forget Wi-Fi" Button */
+                  .wifi-btn {
+                      background-color: red;
+                  }
+
+                  .wifi-btn:hover {
+                      background-color: darkred;
+                  }
+
+                  /* ✅ Disclaimer at the Bottom */
+                  footer {
+                      position: fixed;
+                      bottom: 10px;
+                      width: 100%;
+                      text-align: center;
+                      font-size: 0.9em;
+                      color: gray;
+                  }
+
+                  /* 🌙 Dark Mode Styles */
+                  .dark-mode {
+                      background-color: #222;
+                      color: #eee;
+                  }
+                  /* Dark Mode Title - Neon Blue Glow */
+                  .dark-mode h1 {
+                      color: #5AB1FF;  /* Bright electric blue */
+                      text-shadow: 0 0 12px #FF4500, 0 0 24px #B22222, 0 0 36px #660000; /* Stronger glow in dark mode */
+                  }
+
+                  .dark-mode .log-container {
+                      background: #001F4D !important; /* Force same dark blue */
+                      color: white;                  }
+
+                  .dark-mode .log-entry {
+                      border-bottom: 1px solid #666;
+                  }
+
+                  .dark-mode button {
+                      background-color: #008cff;  /* Brighter blue */
+                      color: white;
+                      border: 1px solid #ffffff;
+                  }
+                  .dark-mode button:hover {
+                      background-color: #0066cc;  /* Deeper blue on hover */
+                  }
+
+              </style>
+          </head>
+
+
+          <body>
+              <!-- Main Title -->
+              <h1>JFG XIAO ESP32C6 Gesture Controller</h1>
+
+              <!-- Last Gesture Display (Blinking Effect) -->
+              <!-- Last Gesture Display -->
+              <p class="gesture-text">Last Gesture: <span id="gesture">None</span></p>
+
+              <!-- Last Action Display -->
+              <p class="gesture-text">Last Action: <span id="action">None</span></p>
+              <div id="flashStats">Loading Flash Memory stats...</div>
+              <!-- Buttons Section -->
+              <a href='/config'><button class="config-btn">Configure Gestures</button></a>
+              <button class="wifi-btn" onclick="forgetWiFi()">Forget Wi-Fi</button>
+
+              <!-- Dark Mode Toggle (Top Right) -->
+              <div class="dark-mode-toggle">
+                  🌙 Dark Mode:
+                  <label class="switch">
+                      <input type="checkbox" id="darkModeToggle">
+                      <span class="slider round"></span>
+                  </label>
+              </div>
+
+
+              <!-- Logs Section -->
+                <h3>&#128220; System Logs</h3>
+                <div class="log-container" id="logContainer"></div>
+
+
+
+                <!-- Disclaimer (Moved Below) -->
+                <footer>
+                    <p class="disclaimer">Designed & Developed by Jesse Greene</p>
+                </footer>
+                <script>
+                    var eventSource = new EventSource("/events");
+
+                    // ✅ Adjust Log Container to Full Width & Dynamic Height
+                    function adjustLogSize() {
+                            let logContainer = document.getElementById("logContainer");
+                            let footerHeight = document.querySelector("footer").offsetHeight;
+                            let maxEntries = 30; // ✅ Matches MAX_LOG_ENTRIES
+                            let lineHeight = 24; // ✅ Approximate line height (px)
+
+                            let availableHeight = window.innerHeight - footerHeight - 200; // ✅ Ensures space for other elements
+                            let maxHeight = Math.min(lineHeight * maxEntries, availableHeight); // ✅ Prevents overlap
+
+                            logContainer.style.width = "calc(100% - 40px)"; // ✅ Keeps equal margins
+                            logContainer.style.maxHeight = maxHeight + "px"; // ✅ Maintains dynamic height
+                        }
+                    // ✅ Adjust log size when resizing the window
+                    window.addEventListener("resize", adjustLogSize);
+                    window.addEventListener("load", adjustLogSize);
+
+                    // ✅ Function to Append Log Entries Efficiently
+                    function addLogEntry(logText) {
+                        let logContainer = document.getElementById("logContainer");
+
+                        let logEntry = document.createElement("div");
+                        logEntry.className = "log-entry";
+                        logEntry.innerText = logText;
+
+                        logContainer.appendChild(logEntry);
+
+                        // ✅ Maintain MAX_LOG_ENTRIES Limit
+                        while (logContainer.children.length > 30) {
+                            logContainer.removeChild(logContainer.firstChild);
+                        }
+
+                        logContainer.scrollTop = logContainer.scrollHeight; // Auto-scroll
+                    }
+
+                    // ✅ Event Listener for Incoming Logs
+                    eventSource.addEventListener("logUpdate", function(event) {
+                        addLogEntry(event.data);
+                    });
+
+                    // ✅ Fetch Logs from Server on Page Load
+                    function fetchLogs() {
+                        fetch("/logs")
+                            .then(response => response.json())
+                            .then(data => {
+                                let logContainer = document.getElementById("logContainer");
+                                logContainer.innerHTML = ""; // Clear previous logs
+
+                                let fragment = document.createDocumentFragment(); // Efficient DOM updates
+                                data.forEach(log => {
+                                    if (log.trim()) {
+                                        let logEntry = document.createElement("div");
+                                        logEntry.className = "log-entry";
+                                        logEntry.innerText = log;
+                                        fragment.appendChild(logEntry);
+                                    }
+                                });
+
+                                logContainer.appendChild(fragment);
+                                logContainer.scrollTop = logContainer.scrollHeight; // Auto-scroll to latest log
+                            })
+                            .catch(error => console.error("❌ Error loading logs:", error));
+                    }
+
+                    // ✅ Dark Mode Toggle Function
+                    function setupDarkMode() {
+                        const toggle = document.getElementById("darkModeToggle");
+                        const body = document.body;
+
+                        if (localStorage.getItem("darkMode") === "enabled") {
+                            body.classList.add("dark-mode");
+                            toggle.checked = true;
+                        }
+
+                        toggle.addEventListener("change", function () {
+                            if (toggle.checked) {
+                                body.classList.add("dark-mode");
+                                localStorage.setItem("darkMode", "enabled");
+                            } else {
+                                body.classList.remove("dark-mode");
+                                localStorage.setItem("darkMode", "disabled");
+                            }
+                        });
+                    }
+
+                    // ✅ Reset Wi-Fi Function
+                    function forgetWiFi() {
+                        if (!confirm("⚠ Reset Wi-Fi settings? This will restart the device.")) return;
+
+                        fetch("/forgetWiFi", { method: "POST" })
+                            .then(response => response.text())
+                            .then(text => {
+                                alert("✅ " + text);
+                                setTimeout(() => location.reload(), 3000);
+                            })
+                            .catch(error => {
+                                console.error("❌ Wi-Fi reset failed:", error);
+                                alert("❌ Error resetting Wi-Fi!");
+                            });
+                    }
+
+                    // ✅ Setup Everything on Page Load
+                    window.onload = function () {
+                        fetchLogs();       // Load logs from server
+                        setupDarkMode();   // Apply dark mode settings
+                        adjustLogSize();   // Adjust logs width & height
+
+                        // ✅ Listen for Gesture & Action Updates
+                        eventSource.addEventListener("gestureUpdate", event => {
+                            document.getElementById("gesture").innerText = event.data;
+                        });
+
+                        eventSource.addEventListener("actionUpdate", event => {
+                            document.getElementById("action").innerText = event.data;
+                        });
+
+                        // ✅ Adjust Log Size Dynamically When Window is Resized
+                        window.addEventListener("resize", adjustLogSize);
+
+                        // ✅ Blinking Effect for Gesture & Action
+                        setInterval(() => {
+                            let gestureElement = document.getElementById("gesture");
+                            let actionElement = document.getElementById("action");
+
+                            if (gestureElement.style.visibility === "hidden") {
+                                gestureElement.style.visibility = "visible";
+                                actionElement.style.visibility = "hidden";
+                            } else {
+                                gestureElement.style.visibility = "hidden";
+                                actionElement.style.visibility = "visible";
+                            }
+                        }, 300); // Blinking every 300ms
+                    };
+                    var eventSource = new EventSource("/events");
+
+                    eventSource.addEventListener("flashStats", function(event) {
+                      let data = JSON.parse(event.data);
+                      document.getElementById("flashStats").innerText = 
+                        `Flash Used: ${data.used}, Free: ${data.free}, Total: ${data.total}`;
+                    });
+
+
+
+                </script>
+          </body>
+
+
+          </html>
+      )rawliteral");
+  });
+
+
+
+
+  server.on(
+    "/saveConfig", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      static String receivedData;
+      if (index == 0) receivedData = "";
+      receivedData += String((char *)data).substring(0, len);
+
+      if (index + len == total) {
+        JsonDocument newDoc;
+        DeserializationError error = deserializeJson(newDoc, receivedData);
+
+        if (error) {
+          request->send(400, "text/plain", "❌ Invalid JSON");
+          return;
+        }
+
+        // ✅ Open preferences storage
+        preferences.begin("gestureConfig", false);
+
+        for (JsonPair kv : newDoc.as<JsonObject>()) {
+          String gesture = kv.key().c_str();
+          String storedActionsJson = preferences.getString((gesture + "_actions").c_str(), "[]");
+
+          // Deserialize existing JSON
+          JsonDocument storedDoc;
+          deserializeJson(storedDoc, storedActionsJson);
+
+          // ✅ Ensure stored data is a valid JSON array
+          if (!storedDoc.is<JsonArray>()) {
+            storedDoc.to<JsonArray>();
+          }
+
+          JsonArray storedActions = storedDoc.as<JsonArray>();
+          JsonArray newActions = kv.value().as<JsonArray>();
+
+          // ✅ Append new actions instead of overwriting
+          for (JsonObject action : newActions) {
+            storedActions.add(action);
+          }
+
+          // ✅ Save the updated JSON array back to preferences
+          String updatedJson;
+          serializeJson(storedDoc, updatedJson);
+          preferences.putString((gesture + "_actions").c_str(), updatedJson);
+
+          Serial.printf("🔹 Updated Gesture Actions for %s -> %s\n", gesture.c_str(), updatedJson.c_str());
+        }
+
+        // ✅ Close preferences storage
+        preferences.end();
+
+        request->send(200, "text/plain", "✅ Configurations saved!");
+      }
+    });
+
+  // Serve the gesture configuration page
+  server.on("/config", HTTP_GET, [](AsyncWebServerRequest *request) {
+    preferences.begin("gestures", true);
+    String page = R"rawliteral(
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Gesture Configuration</title>
+          <style>
+              /* 🔹 Set Background for Normal Mode */
+              body {
+                  font-family: "Arial Unicode MS", "Noto Sans", "Segoe UI Emoji", Arial, sans-serif;
+                  background-color: #FFF2C2;  /* ✅ Light cream background */
+                  margin: 0;
+                  padding: 20px;
+                  text-align: center;
+              }
+                body.dark-mode {
+                    background-color: #222;
+                    color: #eee;
+                }
+
+                .dark-mode input,
+                .dark-mode textarea {
+                    background-color: #333;
+                    color: #eee;
+                    border: 1px solid #888;
+                }
+
+                .dark-mode tbody tr:nth-child(odd) {
+                    background-color: #001F4D;
+                }
+
+                .dark-mode tbody tr:nth-child(even) {
+                    background-color: black;
+                }
+
+              /* 🔹 Dark Mode Toggle - Move to Full Right */
+              .dark-mode-toggle {
+                  position: absolute;
+                  top: 10px;
+                  right: 15px;
+                  font-size: 0.9em;
+              }
+
+              /* 🔹 Make Table Full-Width & Remove Borders */
+              table {
+                  width: 100%;
+                  border-collapse: collapse;
+                  margin-top: 10px;
+              }
+
+              /* 🔹 Alternate Row Colors (Normal Mode) */
+              tbody tr:nth-child(odd) {
+                  background-color: #FFFDF0 !important; /* ✅ Off-white */
+              }
+
+              tbody tr:nth-child(even) {
+                  background-color: #EFF3EA !important; /* ✅ Pale green-gray */
+              }
+
+              /* 🔹 Table Styling - Remove Borders */
+              th, td {
+                  padding: 10px;
+                  text-align: left;
+                  vertical-align: top; /* ✅ Align text to top */
+                  border: none; /* ✅ Removes lines */
+              }
+
+              /* 🔹 Adjust Column Widths */
+              th:nth-child(1), td:nth-child(1) { width: 10%; } /* Gesture */
+              th:nth-child(2), td:nth-child(2) { width: 10%; } /* Action Name */
+              th:nth-child(3), td:nth-child(3) { width: 20%; } /* Server URL */
+              th:nth-child(4), td:nth-child(4) { width: 60%; } /* JSON Body (Takes Extra Space) */
+
+              /* 🔹 Input Fields (Reduced Padding for Compact Look) */
+              input[type="text"], textarea {
+                  width: 100%;
+                  padding: 4px;
+                  border: 1px solid #ccc;
+                  border-radius: 4px;
+                  font-size: 14px;
+              }
+
+              /* ✅ JSON Body - Takes More Space */
+              textarea {
+                  width: 98%;
+                  height: 180px;
+                  resize: vertical;
+                  max-length: 900;
+              }
+
+              /* 🔹 Buttons Moved Above Table */
+              .button-container {
+                  display: flex;
+                  justify-content: center;
+                  gap: 15px;
+                  margin-bottom: 15px; /* Adds spacing before the table */
+              }
+
+              /* 🔹 Button Styling */
+              button {
+                  background-color: #007bff;
+                  color: white;
+                  padding: 12px 20px;
+                  border: none;
+                  cursor: pointer;
+                  font-size: 16px;
+                  border-radius: 4px;
+                  transition: background 0.3s;
+              }
+
+              button:hover {
+                  background-color: #0056b3;
+              }
+
+              .danger-button {
+                  background-color: red;
+              }
+
+              .danger-button:hover {
+                  background-color: darkred;
+              }
+
+              .switch {
+                position: relative;
+                display: inline-block;
+                width: 34px;
+                height: 20px;
+              }
+
+              .switch input { 
+                display: none;
+              }
+
+              .slider {
+                position: absolute;
+                cursor: pointer;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background-color: #bbb;
+                transition: .4s;
+                border-radius: 10px;
+              }
+
+              .slider:before {
+                position: absolute;
+                content: "";
+                height: 14px;
+                width: 14px;
+                left: 3px;
+                bottom: 3px;
+                background-color: white;
+                transition: .4s;
+                border-radius: 50%;
+                box-shadow: 0px 0px 6px rgba(0, 0, 0, 0.5);
+              }
+
+              input:checked + .slider {
+                background-color: #007bff;
+                box-shadow: 0px 0px 10px rgba(0, 123, 255, 0.8);
+              }
+
+              input:checked + .slider:before {
+                transform: translateX(18px);
+              }
+
+
+              /* 🌙 Dark Mode Styling */
+              .dark-mode {
+                  background-color: #222 !important;
+                  color: #eee !important;
+              }
+
+              /* ✅ Fix Table Row Colors */
+              .dark-mode tbody tr:nth-child(odd) {
+                  background-color: #001F4D !important; 
+              }
+              .dark-mode tbody tr:nth-child(even) {
+                  background-color: black !important;
+              }
+
+              /* ✅ Fix Input Fields */
+              .dark-mode input,
+              .dark-mode textarea {
+                  background-color: #333 !important;
+                  color: #eee !important;
+                  border: 1px solid #888 !important;
+              }
+
+              /* ✅ Ensure Focus Styles are Consistent */
+              .dark-mode input:focus,
+              .dark-mode textarea:focus {
+                  background-color: #444 !important;
+                  outline: none;
+              }
+              /* 🔹 Dark Mode Input Fields Match Background */
+              .dark-mode input, .dark-mode textarea {
+                  background-color: transparent;
+                  color: #eee;
+                  border: 1px solid #888;
+              }
+
+              .dark-mode input:focus, .dark-mode textarea:focus {
+                  background-color: #333; /* ✅ Appears only when clicked */
+                  outline: none;
+              }
+
+              /* ✅ Footer (Disclaimer) */
+              footer {
+                  position: fixed;
+                  bottom: 10px;
+                  width: 100%;
+                  text-align: center;
+                  font-size: 0.9em;
+                  color: gray;
+              }
+          </style>
+
+          <script>
+                          
+              document.addEventListener("DOMContentLoaded", function () {
+                  const toggle = document.getElementById("darkModeToggle");
+                  const body = document.body;
+
+                  // Apply saved preference from localStorage
+                  if (localStorage.getItem("darkMode") === "enabled") {
+                      body.classList.add("dark-mode");
+                      toggle.checked = true;
+                  }
+
+                  // Toggle dark mode on checkbox change
+                  toggle.addEventListener("change", function () {
+                      if (toggle.checked) {
+                          body.classList.add("dark-mode");
+                          localStorage.setItem("darkMode", "enabled");
+                      } else {
+                          body.classList.remove("dark-mode");
+                          localStorage.setItem("darkMode", "disabled");
+                      }
+                  });
+              });
+
+              // ✅ Ensure dark mode is applied before page load
+              if (localStorage.getItem("darkMode") === "enabled") {
+                  document.body.classList.add("dark-mode");
+              }
+
+
+              // Export Gesture Configurations as JSON
+              function exportConfig() {
+                  fetch('/exportGestures')
+                  .then(response => response.json())
+                  .then(jsonData => {
+                      const blob = new Blob([JSON.stringify(jsonData, null, 2)], { type: 'application/json' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = 'gesture_configurations.json';
+                      document.body.appendChild(a);
+                      a.click();
+                      document.body.removeChild(a);
+                      URL.revokeObjectURL(url);
+                  })
+                  .catch(err => alert('❌ Export failed: ' + err));
+              }
+
+              // Import Gesture Configurations from JSON
+              function importConfig(event) {
+                  const file = event.target.files[0];
+                  if (!file) {
+                      alert("❌ No file selected!");
+                      return;
+                  }
+
+                  const reader = new FileReader();
+                  reader.onload = function(e) {
+                      fetch('/importGestures', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: e.target.result
+                      })
+                      .then(response => response.text())
+                      .then(text => {
+                          alert(text);
+                          location.reload();
+                      })
+                      .catch(err => alert('❌ Import failed: ' + err));
+                  };
+                  reader.readAsText(file);
+              }
+              function addActionRow(gesture) {
+                let container = document.getElementById(`${gesture}_actions_container`);
+                
+                let row = document.createElement("div");
+                row.innerHTML = `
+                  <input type='text' placeholder='Action Name' class='actionName'>
+                  <input type='text' placeholder='URL' class='actionURL'>
+                  <input type='text' placeholder='JSON Body' class='actionBody'>
+                  <input type='number' placeholder='Delay (ms)' class='actionDelay' value='500'>
+                  <button onclick='this.parentElement.remove()'>❌ Delete</button>
+                `;
+                container.appendChild(row);
+              }
+
+
+              function saveConfig() {
+                  let gestures = ["Right", "Left", "Up", "Down", "Forward", "Backward", "Clock", "AClock", "Wave"];
+                  let configData = {};
+
+                  gestures.forEach(gesture => {
+                      let actionsArray = [];
+
+                      // ✅ Select all action rows for this gesture
+                      document.querySelectorAll(`#${gesture}_actions_container div`).forEach(actionEl => {
+                          let actionName = actionEl.querySelector('.actionName') ? actionEl.querySelector('.actionName').value.trim() : "";
+                          let url = actionEl.querySelector('.actionURL') ? actionEl.querySelector('.actionURL').value.trim() : "";
+                          let body = actionEl.querySelector('.actionBody') ? actionEl.querySelector('.actionBody').value.trim() : "";
+                          let delay = actionEl.querySelector('.actionDelay') ? parseInt(actionEl.querySelector('.actionDelay').value) : 500;
+
+                      // ✅ Allow saving actions even if name or URL is missing
+                      if (!actionName) {
+                          console.warn("⚠️ Action Name is missing, setting to 'Unnamed'");
+                          actionName = "Unnamed";  // Default action name
+                      }
+
+                      if (!url) {
+                          console.warn("⚠️ URL is missing, setting to empty string");
+                          url = "";  // Default empty URL
+                      }
+
+                      // ✅ Save the action regardless
+                      actionsArray.push({
+                          actionName: actionName,
+                          url: url,
+                          body: body,
+                          delay: delay
+                      });
+
+
+
+                      // ✅ Store actions only if there are valid actions
+                      if (actionsArray.length > 0) {
+                          configData[gesture + "_actions"] = actionsArray;
+                      }
+                  });
+
+                  console.log("📤 Sending gesture configuration:", JSON.stringify(configData, null, 2));
+
+                  fetch('/saveConfig', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify(configData)
+                  })
+                  .then(response => response.text())
+                  .then(text => {
+                      alert(text);
+                      location.reload();
+                  })
+                  .catch(err => {
+                      console.error('❌ Save Failed:', err);
+                      alert('❌ Error saving configurations!');
+                  });
+              });
+
+              var eventSource = new EventSource("/events");
+
+              eventSource.addEventListener("flashStats", function(event) {
+                let data = JSON.parse(event.data);
+                document.getElementById("flashStats").innerText = 
+                  `Flash Used: ${data.used}, Free: ${data.free}, Total: ${data.total}`;
+              });
+
+
+          </script>
+    </head>
+
+    <body>
+        <!-- Dark Mode Toggle - Move to Full Right -->
+        <div class="dark-mode-toggle">
+            <h2>🌙 Dark Mode: 
+                <label class="switch">
+                    <input type="checkbox" id="darkModeToggle">  <!-- ✅ Ensure this exists -->
+                    <span class="slider round"></span>
+                </label>
+            </h2>
+        </div>
+
+
+        
+        <!-- Main Configuration Content -->
+        <div class="container">
+            <h1>Configure Gesture Actions</h1>
+
+            <!-- ✅ Buttons Above Table -->
+            <div class="button-container">
+                <button onclick="saveConfig()">💾 Save</button>
+                <button onclick="window.location.href='/'">⬅️ Back to Main Page</button>
+                <button class="danger-button" onclick="clearGestures()">❌ Clear Gestures</button>
+                <button onclick="exportConfig()">📤 Export JSON</button>
+                <input type="file" id="importFile" accept=".json" style="display:none;" onchange="importConfig(event)">
+                <button onclick="document.getElementById('importFile').click();">📥 Import JSON</button>
+
+            </div>
+            <div id="flashStats">Loading Flash Memory stats...</div>
+            <form onsubmit="event.preventDefault();">
+                <table>
+                    <thead>
+                        <tr><th>Gesture</th><th>Action Name</th><th>Server URL</th><th>JSON Body</th></tr>
+                    </thead>
+                    <tbody>)rawliteral";
+
+                        String gestures[] = { "Right", "Left", "Up", "Down", "Forward", "Backward", "Clock", "AClock", "Wave" };
+
+                        for (String gesture : gestures) {
+                          page += "<tr><td>" + gesture + "</td>";
+                          page += "<td colspan='3'>";  // Merging 3 columns to hold multiple actions
+
+                          // ✅ Retrieve all saved actions
+                          String actionsJson = preferences.getString((gesture + "_actions").c_str(), "[]");
+
+                          page += "<div id='" + gesture + "_actions_container'>";
+
+                          JsonDocument doc;
+                          DeserializationError error = deserializeJson(doc, actionsJson);
+                          if (!error && doc.is<JsonArray>()) {
+                            JsonArray actions = doc.as<JsonArray>();
+                            for (JsonObject action : actions) {
+                              String actionName = action["actionName"].as<String>();
+                              String url = action["url"].as<String>();
+                              String body = action["body"].as<String>();
+                              int delay = action["delay"].as<int>();
+
+                              page += "<div>";
+                              page += "<input type='text' placeholder='Action Name' class='actionName' value='" + actionName + "'>";
+                              page += "<input type='text' placeholder='URL' class='actionURL' value='" + url + "'>";
+                              page += "<input type='text' placeholder='JSON Body' class='actionBody' value='" + body + "'>";
+                              page += "<input type='number' placeholder='Delay (ms)' class='actionDelay' value='" + String(delay) + "'>";
+                              page += "<button onclick='this.parentElement.remove()'>❌ Delete</button>";
+                              page += "</div>";
+                            }
+                          }
+
+                          page += "</div>";
+                          page += "<button onclick=\"addActionRow('" + gesture + "')\">➕ Add Action</button>";
+                          page += "</td></tr>";
+                        }
+                        page += R"rawliteral(
+                              </tbody>
+                </table>
+            </form>
+        </div>
+
+                  <!-- Disclaimer -->
+                  <footer>
+                      <p>Designed & Developed by Jesse Greene</p>
+                  </footer>
+              </body>
+
+
+          </html>)rawliteral";
+
+    preferences.end();
+    request->send(200, "text/html", page);
+  });
+
+  // JSON Export Endpoint
+  server.on("/exportGestures", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+
+    // ✅ Loop through stored gestures and add time delay
+    for (int i = 0; i < MAX_GESTURES; i++) {
+      String gestureKey = "gesture_" + String(i);
+      String actionsJson = preferences.getString(gestureKey.c_str(), "[]");
+
+      // Deserialize stored actions
+      JsonDocument actionDoc;
+      deserializeJson(actionDoc, actionsJson);
+
+      JsonObject gestureObj = doc[gestureKey].to<JsonObject>();  // ✅ Modern approach
+      gestureObj["actions"] = actionDoc.as<JsonArray>();
+
+      // ✅ Add the missing "time_delay" field
+      String delayKey = "gesture_" + String(i) + "_delay";
+      int timeDelay = preferences.getInt(delayKey.c_str(), 0);
+      gestureObj["time_delay"] = timeDelay;
+    }
+
+    // Serialize and send response
+    String json;
+    serializeJsonPretty(doc, json);
+    request->send(200, "application/json", json);
+  });
+
+
+
+  // JSON Import Endpoint
+  server.on(
+    "/importGestures", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      static String receivedData;
+      if (index == 0) receivedData = "";
+      receivedData += String((char *)data).substring(0, len);
+
+      if (index + len == total) {
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, receivedData);
+        if (error) {
+          request->send(400, "text/plain", "❌ Invalid JSON file");
+          return;
+        }
+
+        preferences.begin("gestures", false);
+        for (JsonPair kv : doc.as<JsonObject>()) {
+          String gesture = kv.key().c_str();
+          preferences.putString((gesture + "_action").c_str(), kv.value()["action"].as<String>());
+          preferences.putString((gesture + "_url").c_str(), kv.value()["url"].as<String>());
+          preferences.putString((gesture + "_body").c_str(), kv.value()["body"].as<String>());
+        }
+        preferences.end();
+
+        request->send(200, "text/plain", "✅ Gestures imported successfully!");
+      }
+    });
+
+  server.on("/clearGestures", HTTP_POST, [](AsyncWebServerRequest *request) {
+    addLog("🚨 Clearing all gesture preferences...");
+
+    preferences.begin("gestures", false);
+    preferences.clear();  // ✅ This deletes all stored gestures!
+    preferences.end();
+
+    addLog("✅ All gesture preferences have been reset!");
+    request->send(200, "text/plain", "All gesture preferences cleared!");
+  });
+
+
+  // Serve the Wi-Fi configuration page in AP mode
+
+  server.on("/wifiSetup", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("📡 serveWebServer()/wifiSetup: Scanning Wi-Fi networks...");
+
+    // Set to store unique SSIDs
+    std::vector<String> uniqueSSIDs;
+
+    int n = WiFi.scanNetworks();
+    for (int i = 0; i < n; i++) {
+      String ssid = WiFi.SSID(i);
+
+      // ✅ Manually check for duplicates
+      bool found = false;
+      for (const auto &existingSSID : uniqueSSIDs) {
+        if (existingSSID == ssid) {
+          found = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        uniqueSSIDs.push_back(ssid);
+      }
+    }
+
+    // Start generating the HTML page
+    String page = R"rawliteral(
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>JFG Gesture Controller</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <script>
+                    function connectWiFi() {
+                        let ssid = document.getElementById("ssid").value;
+                        let password = document.getElementById("password").value;
+
+                        if (ssid === "") {
+                            alert("⚠️ Please select or enter an SSID!");
+                            return;
+                        }
+
+                        fetch("/saveWiFi", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ "ssid": ssid, "password": password })
+                        }).then(response => response.text())
+                          .then(text => alert(text + "\\nESP32 will restart now."))
+                          .then(() => setTimeout(() => location.reload(), 3000));
+                    }
+                </script>
+                <style>
+                    body { font-family: Arial, sans-serif; text-align: center; background: #f4f4f4; }
+                    .container { max-width: 400px; margin: auto; padding: 20px; background: white; border-radius: 10px; }
+                    select, input, button { width: 100%; padding: 10px; margin: 10px 0; }
+                    button { background: #007bff; color: white; border: none; cursor: pointer; }
+                    button:hover { background: #0056b3; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>JFG ESP32 Wi-Fi Setup</h1>
+                    <label>Select SSID:</label>
+                    <select id="ssid">
+        )rawliteral";
+
+    for (size_t i = 0; i < uniqueSSIDs.size(); i++) {
+      page += "<option value='" + uniqueSSIDs[i] + "'>" + uniqueSSIDs[i] + "</option>";
+    }
+
+
+    // Continue with manual SSID entry
+    page += R"rawliteral(
+                    </select>
+                    <label>Or Enter SSID:</label>
+                    <input type="text" id="manual_ssid" placeholder="Enter SSID (if hidden)">
+                    <script>
+                        document.getElementById("manual_ssid").addEventListener("input", function() {
+                            document.getElementById("ssid").value = this.value;
+                        });
+                    </script>
+                    <label>Password:</label>
+                    <input type="password" id="password" placeholder="Enter Wi-Fi Password">
+                    <button onclick="connectWiFi()">Save & Connect</button>
+                </div>
+            </body>
+            </html>
+        )rawliteral";
+
+    request->send(200, "text/html", page);
+  });
+
+
+
+  server.on(
+    "/saveWiFi", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      String receivedData = String((char *)data).substring(0, len);
+      addLog("📥 Received Wi-Fi Config: " + receivedData);
+      Serial.println("📡 serveWebServer()/saveWiFi: Saving Wi-Fi Setup...");
+
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, receivedData);
+
+      if (error) {
+        addLog("❌ Failed to parse Wi-Fi JSON");
+        request->send(400, "text/plain", "Invalid JSON");
+        return;
+      }
+
+      String newSSID = doc["ssid"].as<String>();
+      String newPassword = doc["password"].as<String>();
+
+      if (newSSID.isEmpty()) {
+        request->send(400, "text/plain", "SSID cannot be empty");
+        return;
+      }
+
+      preferences.begin("wifi", false);
+      preferences.putString("ssid", newSSID);
+      preferences.putString("password", newPassword);
+      preferences.end();
+      Serial.println("📡 serveWebServer()/saveWiFi: Wi-Fi credentials saved! Restarting ESP...");
+
+      addLog("✅ Wi-Fi credentials saved! Restarting ESP...");
+      request->send(200, "text/plain", "Wi-Fi credentials saved! Rebooting...");
+
+      delay(1000);
+      ESP.restart();  // ✅ Restart ESP32 to apply new Wi-Fi settings
+    });
+
+  server.on("/forgetWiFi", HTTP_POST, [](AsyncWebServerRequest *request) {
+    addLog("🚨 Forgetting Wi-Fi settings...");
+
+    preferences.begin("wifi", false);
+    preferences.remove("ssid");
+    preferences.remove("password");
+    preferences.end();
+
+    request->send(200, "text/plain", "Wi-Fi settings erased! Restarting...");
+
+    delay(1000);
+    ESP.restart();  // ✅ Restart ESP to enter AP mode
+  });
+
+
+  server.on("/logs", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    JsonArray jsonArray = doc.to<JsonArray>();
+
+    for (int i = 0; i < MAX_LOG_ENTRIES; i++) {
+      int index = (logIndex + i) % MAX_LOG_ENTRIES;
+      if (logBuffer[index].length() > 0) {
+        jsonArray.add(logBuffer[index]);
+      }
+    }
+
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  server.addHandler(&events);  // Ensure events handler is registered!
+  server.begin();
+  Serial.println("Web server started successfully!");
+}
+
+
+
+void sendFlashStats() {
+  nvs_stats_t stats;
+  nvs_get_stats(NULL, &stats);
+
+  JsonDocument doc;
+  doc["used"] = stats.used_entries;
+  doc["free"] = stats.free_entries;
+  doc["total"] = stats.total_entries;
+
+  String json;
+  serializeJson(doc, json);
+
+  events.send(json.c_str(), "flashStats", millis());
+}
+
+void attemptWiFiConnection() {
+  addLog("🔄 attemptWiFiConnection() Attempting to connect to Wi-Fi...");
+
+  WiFi.disconnect(true, true);  // Ensure a clean start
+  delay(1000);                  // Small delay for clean reconnection
+  WiFi.mode(WIFI_STA);          // Set Wi-Fi mode to station
+  WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+
+  int retries = 60;  // Increase retries (30s timeout)
+  while (WiFi.status() != WL_CONNECTED && retries-- > 0) {
+    delay(500);
+    Serial.printf("⏳ Connecting... (%d)\n", retries);
+    updateDisplay("Connecting to Wi-Fi...", "...", "", "");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    addLog("✅ Wi-Fi Connected!");
+    Serial.printf("🎉 Connected! IP Address: %s\n", WiFi.localIP().toString().c_str());
+
+    stopAPMode();  // Stop AP mode since we are connected
+    isAPMode = false;
+    // Try to sync Time.
+
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+    Serial.print("⏳ Syncing Time...");
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+      Serial.println("❌ Failed to obtain time.");
+    } else {
+      Serial.println("✅ Time Synchronized!");
+    }
+
+    serveWebServer();  // Start web server in normal mode
+
+    //updateDisplay("JFG Gesture Controller", "Waiting for gesture", "No Action", WiFi.localIP().toString().c_str());
+  } else {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("\n❌ Wi-Fi Connection Failed. Checking failure reason...");
+      switch (WiFi.status()) {
+        case WL_NO_SSID_AVAIL:
+          Serial.println("⚠️ No SSID found. Check if the router is powered on.");
+          break;
+        case WL_CONNECT_FAILED:
+          Serial.println("🚨 Connection failed. Incorrect password?");
+          break;
+        case WL_IDLE_STATUS:
+          Serial.println("🔄 Connection idle. Waiting...");
+          break;
+        default:
+          Serial.println("🛑 Unknown Wi-Fi error.");
+      }
+    }
+    Serial.println("\n❌ Wi-Fi Connection Failed. Entering AP Mode.");
+    startAPMode();
+    updateDisplay("Wi-Fi Failed", "AP Mode Active", "", WiFi.softAPIP().toString().c_str());
+  }
+}
+
+
+
+void setup() {
+  Serial.begin(115200);
+
+
+  addLog("ESP32 Gesture System Initializing...");
+
+  u8g2.begin();
+  pinMode(resetButtonPin, INPUT_PULLUP);
+
+  updateDisplay("JFG Gesture Controller", "", "", "Connecting...");
+
+  WiFi.mode(WIFI_STA);
+
+  preferences.begin("wifi", true);  // Open in read-only mode
+  wifiSSID = preferences.getString("ssid", "");
+  wifiPassword = preferences.getString("password", "");
+  preferences.end();
+  String addLogMessage = "📌 Debug: Stored SSID = " + String(wifiSSID.c_str());
+  addLog(addLogMessage);
+  addLogMessage = "📌 Debug: Stored Password = " + String(wifiPassword.c_str());
+  addLog(addLogMessage);  // Remove this in production
+
+
+
+  if (wifiSSID.isEmpty()) {
+    Serial.println("🚨 No saved Wi-Fi credentials. Entering AP Mode.");
+    startAPMode();
+  } else {
+    addLog("🔎 Checking Saved Wi-Fi SSID...");
+    Serial.printf("Saved Wi-Fi SSID: %s\n", wifiSSID.c_str());
+    attemptWiFiConnection();
+  }
+
+
+
+
+
+  // Initialize Gesture Sensor using RevEng_PAJ7620
+  Serial.println("🖐 Initializing Gesture Sensor...");
+  if (gestureSensor.begin()) {  // success = 1 (true)
+    Serial.println("✅ Gesture Sensor Initialized Successfully!");
+    addLog("✅ Gesture Sensor Ready! Waiting for gesture...");
+    updateDisplay("JFG Gesture Controller", "Waiting for Gesture...", "No Action", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("❌ Gesture Sensor Initialization Failed!");
+    updateDisplay("❌ Sensor Error", "Check Connections", "No Action", WiFi.localIP().toString().c_str());
+  }
+
+  // Load Gesture Preferences after initialization
+  preferences.begin("gestures", true);
+  for (String g : { "Right", "Left", "Up", "Down", "Forward", "Backward", "Clock", "AClock", "Wave" }) {
+    String url = preferences.getString((g + "_url").c_str(), "");
+    if (!url.isEmpty()) {
+      addLog("✔️ Loaded URL for " + g);
+    }
+  }
+  preferences.end();
+}
+
+
+
+// Loop function continuously runs
+void loop() {
+  if (isAPMode) {
+    dnsServer.processNextRequest();
+  }
+
+  static unsigned long buttonPressTime = 0;
+  if (digitalRead(resetButtonPin) == LOW) {  // Button pressed
+    if (buttonPressTime == 0) {
+      buttonPressTime = millis();                    // Start timing
+    } else if (millis() - buttonPressTime > 3000) {  // 3-second hold
+      Serial.println("🚨 Reset Button Held! Erasing Wi-Fi...");
+      preferences.begin("wifi", false);
+      preferences.clear();
+      preferences.end();
+      delay(500);
+      ESP.restart();  // Restart ESP32 to enter AP mode
+    }
+  } else {
+    buttonPressTime = 0;  // Reset timer if button is released
+  }
+  // ✅ Ensure sendFlashStats() is called immediately once in the first loop iteration
+  static bool firstRun = true;
+  if (firstRun || millis() - lastFlashUpdate > 60000) {  // every 60 sec
+    sendFlashStats();
+    lastFlashUpdate = millis();
+    firstRun = false;  // ✅ Prevents running it more than once at startup
+  }
+
+  static String lastGesture = "";
+  Gesture gesture = gestureSensor.readGesture();
+  String gestureStr = "";
+
+  switch (gesture) {
+    case GES_RIGHT: gestureStr = "Right"; break;
+    case GES_LEFT: gestureStr = "Left"; break;
+    case GES_UP: gestureStr = "Up"; break;
+    case GES_DOWN: gestureStr = "Down"; break;
+    case GES_FORWARD: gestureStr = "Forward"; break;
+    case GES_BACKWARD: gestureStr = "Backward"; break;
+    case GES_CLOCKWISE: gestureStr = "Clock"; break;
+    case GES_ANTICLOCKWISE: gestureStr = "AClock"; break;
+    case GES_WAVE: gestureStr = "Wave"; break;
+    default: break;
+  }
+
+  if (!gestureStr.isEmpty() && gestureStr != lastGesture) {
+    lastGesture = gestureStr;
+    executeGestureActions(gestureStr);
+  }
+
+  delay(200);
+}
