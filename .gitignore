@@ -1,0 +1,16 @@
+# macOS system files
+.DS_Store
+
+# Arduino IDE temporary files
+*.tmp
+*.bak
+
+# VS Code project settings
+.vscode/
+
+# JetBrains IDEs (like CLion, WebStorm)
+.idea/
+
+# Arduino build folders (if using CLI or sketches build locally)
+build/
+
