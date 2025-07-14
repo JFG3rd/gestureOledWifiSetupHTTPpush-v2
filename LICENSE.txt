@@ -1,0 +1,21 @@
+Custom License - gestureOledWifiSetupHTTPpush-v2
+
+Copyright (c) 2025 Jesse Greene
+
+Permission is hereby granted to any individual or organization to use, copy, modify, and contribute to this project for personal or non-commercial purposes, under the following conditions:
+
+1. COMMERCIAL USE
+   - Commercial use (including selling, licensing, or distributing for profit) is NOT permitted without prior written consent from the author (Jesse Greene).
+   - If permission is granted, the author is entitled to a fair share of the revenue or profits, to be negotiated in good faith.
+
+2. ATTRIBUTION
+   - All modified versions, forks, or distributions must include proper attribution to Jesse Greene as the original creator.
+   - The author's name must be included in all documentation, interfaces, and any public presentations or demonstrations.
+
+3. CONTRIBUTIONS
+   - Contributions are welcome and encouraged. By contributing, you agree to license your changes under this same license.
+
+4. NO WARRANTY
+   - This project is provided "as-is" without warranty of any kind. Use at your own risk.
+
+To request commercial licensing rights, please contact: Jesse Greene
